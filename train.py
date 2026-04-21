@@ -829,22 +829,23 @@ def train_one_expert(
         soft_row_err = eval_stats["soft_row_err"]
         soft_col_err = eval_stats["soft_col_err"]
 
-        improved = False
-        if best_ema == float("inf"):
-            improved = True
-        else:
-            threshold = best_ema * (1.0 - cfg.early_stop_rel_delta)
-            if hard_eval_ema < threshold:
-                improved = True
-
-        if improved:
-            best_ema = hard_eval_ema
+        if hard_eval_loss_val < best_loss:
             best_loss = hard_eval_loss_val
             best_perm = eval_stats["perm_hard_eval"]
             best_group = eval_stats["group_hard_eval"]
             best_group_assignment = eval_stats["A_soft_eval"]
             best_score = model.score.detach().cpu().clone()
             best_epoch = epoch
+        improved_for_ema = False
+        if best_ema == float("inf"):
+            improved_for_ema = True
+        else:
+            threshold = best_ema * (1.0 - cfg.early_stop_rel_delta)
+            if hard_eval_ema < threshold:
+                improved_for_ema = True
+
+        if improved_for_ema:
+            best_ema = hard_eval_ema
             no_improve_steps = 0
         else:
             no_improve_steps += 1
