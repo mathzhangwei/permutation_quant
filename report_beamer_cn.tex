@@ -1,0 +1,442 @@
+\documentclass[aspectratio=169,professionalfonts]{ctexbeamer}
+
+\usetheme{Boadilla}
+\useinnertheme{rectangles}
+\usefonttheme{professionalfonts}
+\setbeamertemplate{navigation symbols}{}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{mathtools}
+
+\definecolor{DeepBlue}{RGB}{20,45,110}
+\definecolor{SoftBlue}{RGB}{232,238,250}
+\definecolor{Accent}{RGB}{180,60,40}
+\definecolor{DarkText}{RGB}{35,35,35}
+
+\setbeamercolor{title}{fg=white,bg=DeepBlue}
+\setbeamercolor{frametitle}{fg=DeepBlue,bg=SoftBlue}
+\setbeamercolor{structure}{fg=DeepBlue}
+\setbeamercolor{normal text}{fg=DarkText,bg=white}
+\setbeamercolor{block title}{fg=white,bg=DeepBlue}
+\setbeamercolor{block body}{fg=DarkText,bg=SoftBlue}
+\setbeamercolor{item projected}{fg=white,bg=DeepBlue}
+
+\setbeamertemplate{title page}{
+  \vspace{1.2cm}
+  \begin{beamercolorbox}[wd=\paperwidth,ht=2.3cm,dp=0.4cm,leftskip=1cm]{title}
+    {\LARGE \inserttitle\par}
+    \vspace{0.35cm}
+    {\large \insertauthor\par}
+    \vspace{0.15cm}
+    {\normalsize \insertdate\par}
+  \end{beamercolorbox}
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Loss}{\mathcal{L}}
+\newcommand{\Stop}{\operatorname{sg}}
+\newcommand{\MSE}{\operatorname{MSE}}
+\newcommand{\softmaxop}{\operatorname{SoftSort}}
+\newcommand{\Sinkhorn}{\operatorname{Sinkhorn}}
+\newcommand{\argsort}{\operatorname{argsort}}
+
+\title{基于可学习通道重排的 MXFP4 量化优化}
+\author{组会汇报}
+\date{\today}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{1. 问题背景}
+  考虑 MoE 中某个 expert 的 \texttt{down\_proj}：
+  \[
+    x \in \R^{B \times D},\qquad
+    w \in \R^{O \times D},\qquad
+    y_{\mathrm{ref}} = x w^\top \in \R^{B \times O}
+  \]
+
+  \vspace{0.4em}
+  在不做通道重排时，直接量化得到
+  \[
+    y_q^{(\mathrm{id})} = Q(x)\,Q(w)^\top
+  \]
+  其重建误差通常受输入通道排列方式影响较大，特别是在分组量化场景下：
+  \[
+    \Loss_{\mathrm{id}} = \MSE\!\left(y_q^{(\mathrm{id})},\, y_{\mathrm{ref}}\right)
+  \]
+
+  \vspace{0.4em}
+  本工作的核心问题是：
+  \begin{block}{目标}
+    是否能仅通过学习一个输入通道 permutation，在不改权重数值的前提下，降低 MXFP4 量化误差？
+  \end{block}
+\end{frame}
+
+\begin{frame}{2. 核心思路}
+  我们为每个 expert 学习一个 permutation $P \in \{0,1\}^{D \times D}$，满足
+  \[
+    P\mathbf{1}=\mathbf{1},\qquad P^\top \mathbf{1}=\mathbf{1}
+  \]
+
+  重排后的激活与权重为
+  \[
+    x' = xP^\top,\qquad w' = wP^\top
+  \]
+
+  量化输出写作
+  \[
+    y_q(P) = Q(xP^\top)\,Q(wP^\top)^\top
+  \]
+
+  因而目标变为
+  \[
+    \min_{P \in \Pi_D}\ \Loss_{\mathrm{recon}}(P)
+    = \min_{P \in \Pi_D} \MSE\!\left(y_q(P),\, y_{\mathrm{ref}}\right)
+  \]
+  其中 $\Pi_D$ 表示所有 $D$ 维 permutation matrix 的集合。
+\end{frame}
+
+\begin{frame}{3. 参数化：从离散 permutation 到连续 score}
+  直接优化离散 permutation 很困难，因此引入一维可学习参数
+  \[
+    s = (s_1,\dots,s_D) \in \R^D
+  \]
+
+  \vspace{0.4em}
+  先做标准化：
+  \[
+    \tilde{s} = \frac{s-\operatorname{mean}(s)}{\operatorname{std}(s)+\varepsilon}
+  \]
+
+  \vspace{0.4em}
+  再由 score 诱导排序。离散路径上，
+  \[
+    \pi_{\mathrm{hard}} = \argsort(\tilde{s})
+  \]
+  并进一步构造 hard permutation matrix
+  \[
+    P_{\mathrm{hard}}[r,\pi_{\mathrm{hard}}(r)] = 1
+  \]
+
+  \vspace{0.4em}
+  这样，每个 expert 的训练参数仅为长度 $D$ 的 score 向量，参数量非常小。
+\end{frame}
+
+\begin{frame}{4. Soft permutation 的构造}
+  对标准化后的 score，先排序得到
+  \[
+    \tilde{s}_{(1)} \le \tilde{s}_{(2)} \le \cdots \le \tilde{s}_{(D)}
+  \]
+
+  构造 cost matrix：
+  \[
+    C_{r,i} =
+    \begin{cases}
+      |\tilde{s}_{(r)}-\tilde{s}_i|, & \text{L1 metric}\\[0.3em]
+      (\tilde{s}_{(r)}-\tilde{s}_i)^2, & \text{L2 metric}
+    \end{cases}
+  \]
+
+  再定义
+  \[
+    \log \alpha = -\frac{C}{\tau}
+  \]
+  通过 Sinkhorn 归一化得到 soft permutation：
+  \[
+    P_{\mathrm{soft}} = \Sinkhorn(\exp(\log \alpha))
+  \]
+
+  \vspace{0.3em}
+  其中温度 $\tau$ 控制软硬程度：
+  \[
+    \tau \downarrow \quad \Longrightarrow \quad P_{\mathrm{soft}} \text{ 更接近 one-hot/permutation}
+  \]
+\end{frame}
+
+\begin{frame}{5. Permutation 的 STE}
+  训练时同时维护：
+  \[
+    P_{\mathrm{hard}},\qquad P_{\mathrm{soft}}
+  \]
+
+  用 straight-through estimator 将二者结合：
+  \[
+    P_{\mathrm{ste}}
+    = P_{\mathrm{hard}} - \Stop(P_{\mathrm{soft}}) + P_{\mathrm{soft}}
+  \]
+
+  其性质是：
+  \[
+    \text{forward: } P_{\mathrm{ste}} \equiv P_{\mathrm{hard}},
+    \qquad
+    \text{backward: } \frac{\partial P_{\mathrm{ste}}}{\partial s}
+    = \frac{\partial P_{\mathrm{soft}}}{\partial s}
+  \]
+
+  \begin{block}{解释}
+    前向时，我们尽量按照真实离散 permutation 来训练；
+    反向时，梯度仍然通过 soft relaxation 传播。
+  \end{block}
+\end{frame}
+
+\begin{frame}{6. MXFP4 Fake Quant 与量化 STE}
+  对重排后的张量按最后一维分组，group size 记为 $g$。对每个分组：
+  \[
+    a_{\max} = \max |x|
+  \]
+  主 scale 取为
+  \[
+    s_{\mathrm{blk}} = 2^{\left\lfloor \log_2\left(\frac{8}{7} a_{\max}\right) \right\rfloor}
+  \]
+
+  再对归一化值计算 secondary scale，并执行离散化。最终得到 fake quant 值 $Q(x)$。
+
+  \vspace{0.4em}
+  为了让量化可训练，使用
+  \[
+    Q_h(x) = x + \Stop(Q(x)-x)
+  \]
+
+  因而：
+  \[
+    \text{forward 用 } Q(x),\qquad
+    \text{backward 近似看作 identity}
+  \]
+
+  这意味着当前方案中同时存在两层 STE：
+  \[
+    s \rightarrow P_{\mathrm{ste}} \rightarrow Q_h(\cdot)
+  \]
+\end{frame}
+
+\begin{frame}{7. 损失函数}
+  参考输出定义为
+  \[
+    y_{\mathrm{ref}} = xw^\top
+  \]
+
+  训练时前向路径为
+  \[
+    x_{\mathrm{perm}} = xP_{\mathrm{ste}}^\top,\qquad
+    w_{\mathrm{perm}} = wP_{\mathrm{ste}}^\top
+  \]
+  \[
+    y_q = Q_h(x_{\mathrm{perm}})\,Q_h(w_{\mathrm{perm}})^\top
+  \]
+
+  当前实际优化目标：
+  \[
+    \Loss
+    = \underbrace{\MSE(y_q, y_{\mathrm{ref}})}_{\Loss_{\mathrm{recon}}}
+    + \lambda_{\mathrm{ds}}
+    \underbrace{\left(
+      \|P_{\mathrm{soft}}\mathbf{1}-\mathbf{1}\|_2^2
+      +
+      \|P_{\mathrm{soft}}^\top\mathbf{1}-\mathbf{1}\|_2^2
+    \right)}_{\Loss_{\mathrm{ds}}}
+  \]
+
+  当前版本只保留了真正使用的双随机正则项。
+\end{frame}
+
+\begin{frame}{8. 训练与评估口径}
+  \textbf{训练口径}
+  \[
+    \Loss_{\mathrm{train}}
+    = \Loss\bigl(P_{\mathrm{ste}}\bigr)
+  \]
+
+  \textbf{评估口径}
+  \[
+    \Loss_{\mathrm{hard}}
+    = \MSE\!\left(
+      Q_h(xP_{\mathrm{hard}}^\top)\,Q_h(wP_{\mathrm{hard}}^\top)^\top,\,
+      y_{\mathrm{ref}}
+    \right)
+  \]
+
+  \vspace{0.4em}
+  baseline 则取 identity permutation：
+  \[
+    P = I
+    \quad \Longrightarrow \quad
+    \Loss_{\mathrm{base}} = \Loss_{\mathrm{hard}}(I)
+  \]
+
+  相对收益定义为
+  \[
+    \mathrm{Improve}
+    = \frac{\Loss_{\mathrm{base}}-\Loss_{\mathrm{final}}}
+    {\max(|\Loss_{\mathrm{base}}|,\epsilon)}
+  \]
+
+  \vspace{0.4em}
+  训练中真正关心的不是单调下降，而是最终 hard 口径是否优于 baseline。
+\end{frame}
+
+\begin{frame}{9. 温度退火与 Early Stop}
+  温度采用指数退火：
+  \[
+    \tau_t
+    =
+    \tau_{\mathrm{start}}
+    \left(
+      \frac{\tau_{\mathrm{end}}}{\tau_{\mathrm{start}}}
+    \right)^{\frac{t}{T-1}}
+  \]
+
+  \vspace{0.4em}
+  为降低离散训练的高频波动，对 hard eval loss 做 EMA：
+  \[
+    m_t =
+    \begin{cases}
+      \ell_t, & t=0\\
+      \beta m_{t-1} + (1-\beta)\ell_t, & t\ge 1
+    \end{cases}
+  \]
+  其中 $\ell_t=\Loss_{\mathrm{hard}}^{(t)}$。
+
+  \vspace{0.4em}
+  若连续若干轮没有达到相对改善阈值，则 early stop。
+
+  \begin{block}{作用}
+    这一步主要是稳住停止条件，而不是保证训练曲线单调。
+  \end{block}
+\end{frame}
+
+\begin{frame}{10. 局部离散 Refinement}
+  训练结束后，从当前最优 permutation 出发，做少量 pair-swap hill climbing：
+  \[
+    \pi \rightarrow \pi'
+  \]
+  其中 $\pi'$ 由交换 $\pi$ 中两个位置得到。
+
+  对每个候选 permutation，重新计算
+  \[
+    \Loss_{\mathrm{hard}}(\pi')
+  \]
+  若
+  \[
+    \Loss_{\mathrm{hard}}(\pi') < \Loss_{\mathrm{hard}}(\pi)
+  \]
+  则接受更新。
+
+  \vspace{0.4em}
+  这一步的意义是：
+  \begin{itemize}
+    \item 训练阶段优化的是可导近似目标
+    \item refinement 直接在真实 hard 目标上做局部离散搜索
+    \item 常能额外捡到一部分 hard loss 收益
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{11. 多卡并行策略}
+  当前实现采用 expert 级并行，而非梯度同步并行。
+
+  对于总 expert 数 $E$、进程数 $W$、当前 rank $r$：
+  \[
+    \mathcal{E}_r = \{\, r,\ r+W,\ r+2W,\ \dots \,\}
+  \]
+
+  每个进程只处理集合 $\mathcal{E}_r$ 中的 expert。
+
+  \vspace{0.5em}
+  设备分配：
+  \[
+    \text{device} = \texttt{npu:LOCAL\_RANK}
+  \]
+
+  这种方式的特点：
+  \begin{itemize}
+    \item expert 间相互独立，天然适合任务并行
+    \item 实现比 DDP 更简单
+    \item 无需在 rank 间同步 score 参数
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{12. 结果产物设计}
+  每个 expert 会保存一份结果对象，包含：
+  \[
+    \{\text{config},\ \text{baseline},\ \text{best\_perm},\ \text{best\_score},\ \text{loss history},\ \dots\}
+  \]
+
+  关键字段包括：
+  \begin{itemize}
+    \item $\Loss_{\mathrm{base}}$
+    \item $\Loss_{\mathrm{best\_before\_refine}}$
+    \item $\Loss_{\mathrm{refined}}$
+    \item $\Loss_{\mathrm{final}}$
+    \item best permutation / best score
+    \item loss / EMA / tau / lr 的历史序列
+  \end{itemize}
+
+  同时提供后处理脚本，为每个 expert 绘制：
+  \begin{itemize}
+    \item hard eval loss 曲线
+    \item baseline 水平线
+    \item refine 前后最优值对比
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{13. 当前现象与理解}
+  当前实验已经实现：
+  \begin{itemize}
+    \item 方法链路打通
+    \item 多卡运行
+    \item 结果保存与自动画图
+  \end{itemize}
+
+  但目前观察到：
+  \[
+    \Loss_{\mathrm{hard}}^{(t)}
+  \]
+  在不少 expert 上存在较强波动，整体下降趋势也不总是明显。
+
+  \vspace{0.4em}
+  这与以下因素有关：
+  \begin{itemize}
+    \item permutation 本身是离散对象
+    \item 训练中同时用了 permutation STE 和 quant STE
+    \item soft 训练目标与 hard 评估目标之间存在 gap
+    \item 学习率、温度退火等超参可能仍需继续调
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{14. 下一步工作}
+  后续重点并不在工程链路，而在训练稳定性与收益验证：
+
+  \vspace{0.4em}
+  \begin{block}{调参与训练稳定性}
+    调整学习率、温度终值、退火速度，观察 hard eval 口径是否更稳定优于 baseline。
+  \end{block}
+
+  \begin{block}{统计性验证}
+    统计更多层、更多 expert 上的收益分布，而不是只看单个曲线。
+  \end{block}
+
+  \begin{block}{目标对齐}
+    进一步分析 soft 训练路径与 hard 最终目标之间的差距，以及 refine 的贡献占比。
+  \end{block}
+\end{frame}
+
+\begin{frame}{总结}
+  \begin{enumerate}
+    \item 当前方案本质上是在 expert 级别学习量化友好的输入通道重排
+    \item 方法上结合了 softsort、Sinkhorn、permutation STE 与 quant STE
+    \item 工程上已经支持多卡并行、结果保存与自动可视化
+    \item 当前主要瓶颈是训练稳定性与最终收益强度，而不是实现完整性
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}
+  \centering
+  {\LARGE 谢谢}
+\end{frame}
+
+\end{document}
