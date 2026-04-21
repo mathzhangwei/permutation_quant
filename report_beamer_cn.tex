@@ -43,7 +43,7 @@
 \newcommand{\Sinkhorn}{\operatorname{Sinkhorn}}
 \newcommand{\argsort}{\operatorname{argsort}}
 
-\title{基于可学习通道重排的 MXFP4 量化优化}
+\title{基于 OT 松弛的 Channel Grouping 优化}
 \author{组会汇报}
 \date{\today}
 
@@ -74,32 +74,26 @@
   \vspace{0.4em}
   本工作的核心问题是：
   \begin{block}{目标}
-    是否能仅通过学习一个输入通道 permutation，在不改权重数值的前提下，降低 MXFP4 量化误差？
+    在不修改权重数值的前提下，只通过学习 channel grouping，降低 MXFP4 分组量化误差。
   \end{block}
 \end{frame}
 
 \begin{frame}{2. 核心思路}
-  我们为每个 expert 学习一个 permutation $P \in \{0,1\}^{D \times D}$，满足
+  真实关心的对象不是完整 permutation，而是 grouping：
   \[
-    P\mathbf{1}=\mathbf{1},\qquad P^\top \mathbf{1}=\mathbf{1}
+    \mathcal{G} = \{G_1,\dots,G_M\}, \qquad |G_m| = k,\qquad M=D/k
   \]
 
-  重排后的激活与权重为
-  \[
-    x' = xP^\top,\qquad w' = wP^\top
-  \]
+  \vspace{0.4em}
+  但为了保持可导训练，我们不直接优化 grouping，而是：
+  \begin{enumerate}
+    \item 用一维 score 诱导排序
+    \item 用 Sinkhorn 得到位置级 soft assignment $P_{\mathrm{soft}}$
+    \item 再用固定块矩阵把位置聚合成组
+  \end{enumerate}
 
-  量化输出写作
-  \[
-    y_q(P) = Q(xP^\top)\,Q(wP^\top)^\top
-  \]
-
-  因而目标变为
-  \[
-    \min_{P \in \Pi_D}\ \Loss_{\mathrm{recon}}(P)
-    = \min_{P \in \Pi_D} \MSE\!\left(y_q(P),\, y_{\mathrm{ref}}\right)
-  \]
-  其中 $\Pi_D$ 表示所有 $D$ 维 permutation matrix 的集合。
+  \vspace{0.4em}
+  因而我们保留了 OT 风格的连续松弛，同时把最终语义切回 group。
 \end{frame}
 
 \begin{frame}{3. 参数化：从离散 permutation 到连续 score}
@@ -128,7 +122,7 @@
   这样，每个 expert 的训练参数仅为长度 $D$ 的 score 向量，参数量非常小。
 \end{frame}
 
-\begin{frame}{4. Soft permutation 的构造}
+\begin{frame}{4. 位置级 OT 松弛}
   对标准化后的 score，先排序得到
   \[
     \tilde{s}_{(1)} \le \tilde{s}_{(2)} \le \cdots \le \tilde{s}_{(D)}
@@ -147,45 +141,76 @@
   \[
     \log \alpha = -\frac{C}{\tau}
   \]
-  通过 Sinkhorn 归一化得到 soft permutation：
+  通过 Sinkhorn 归一化得到 soft position assignment：
   \[
     P_{\mathrm{soft}} = \Sinkhorn(\exp(\log \alpha))
   \]
 
+  其可看作熵正则 OT / assignment：
+  \[
+    \min_{P \in \mathcal{B}}
+    \langle P, C \rangle - \tau H(P)
+  \]
+  其中 $\mathcal{B}$ 是双随机矩阵集合。
+
   \vspace{0.3em}
   其中温度 $\tau$ 控制软硬程度：
   \[
-    \tau \downarrow \quad \Longrightarrow \quad P_{\mathrm{soft}} \text{ 更接近 one-hot/permutation}
+    \tau \downarrow \quad \Longrightarrow \quad P_{\mathrm{soft}} \text{ 更接近一一匹配}
   \]
 \end{frame}
 
-\begin{frame}{5. Permutation 的 STE}
-  训练时同时维护：
+\begin{frame}{5. 从位置到分组：\texorpdfstring{$A_{\mathrm{soft}} = P_{\mathrm{soft}}^\top B$}{Asoft = Psoft^T B}}
+  定义固定块矩阵
   \[
-    P_{\mathrm{hard}},\qquad P_{\mathrm{soft}}
+    B \in \{0,1\}^{D \times M}, \qquad
+    B[r,m]=1 \Leftrightarrow r \text{ 属于第 } m \text{ 个组的位置块}
   \]
 
-  用 straight-through estimator 将二者结合：
+  于是 group assignment 写成：
   \[
-    P_{\mathrm{ste}}
-    = P_{\mathrm{hard}} - \Stop(P_{\mathrm{soft}}) + P_{\mathrm{soft}}
+    A_{\mathrm{soft}} = P_{\mathrm{soft}}^\top B \in \R^{D \times M}
   \]
 
-  其性质是：
+  展开后：
   \[
-    \text{forward: } P_{\mathrm{ste}} \equiv P_{\mathrm{hard}},
-    \qquad
-    \text{backward: } \frac{\partial P_{\mathrm{ste}}}{\partial s}
-    = \frac{\partial P_{\mathrm{soft}}}{\partial s}
+    A_{\mathrm{soft}}[i,m]
+    =
+    \sum_{r=1}^{D} P_{\mathrm{soft}}[r,i]\, B[r,m]
+  \]
+
+  含义：
+  \[
+    \text{channel } i \text{ 落入第 } m \text{ 个 group 的软权重}
+  \]
+
+  这一步等价于把 position-level OT plan 做 block aggregation。
+\end{frame}
+
+\begin{frame}{6. Group-level STE}
+  由 hard 排序同样可得到 hard grouping：
+  \[
+    A_{\mathrm{hard}} = P_{\mathrm{hard}}^\top B
+  \]
+
+  训练中使用 group-level STE：
+  \[
+    A_{\mathrm{ste}}
+    = A_{\mathrm{hard}} - \Stop(A_{\mathrm{soft}}) + A_{\mathrm{soft}}
+  \]
+
+  为了在代码中保持前向可执行，我们进一步把 soft grouping 均匀摊回位置空间：
+  \[
+    P_{\mathrm{group\_soft}} = \frac{1}{k} B A_{\mathrm{soft}}^\top
   \]
 
   \begin{block}{解释}
-    前向时，我们尽量按照真实离散 permutation 来训练；
-    反向时，梯度仍然通过 soft relaxation 传播。
+    前向仍使用 hard 排序对应的真实分组；
+    反向梯度则通过 group-level soft surrogate 传播，从而让训练对象真正变成 grouping。
   \end{block}
 \end{frame}
 
-\begin{frame}{6. MXFP4 Fake Quant 与量化 STE}
+\begin{frame}{7. MXFP4 Fake Quant 与量化 STE}
   对重排后的张量按最后一维分组，group size 记为 $g$。对每个分组：
   \[
     a_{\max} = \max |x|
@@ -209,47 +234,51 @@
     \text{backward 近似看作 identity}
   \]
 
-  这意味着当前方案中同时存在两层 STE：
+  当前方案中存在两层连续近似：
   \[
-    s \rightarrow P_{\mathrm{ste}} \rightarrow Q_h(\cdot)
+    s \rightarrow P_{\mathrm{soft}} \rightarrow A_{\mathrm{soft}} \rightarrow Q_h(\cdot)
   \]
 \end{frame}
 
-\begin{frame}{7. 损失函数}
+\begin{frame}{8. 损失函数}
   参考输出定义为
   \[
     y_{\mathrm{ref}} = xw^\top
   \]
 
-  训练时前向路径为
+  训练时实际执行的前向路径仍可写成
   \[
-    x_{\mathrm{perm}} = xP_{\mathrm{ste}}^\top,\qquad
-    w_{\mathrm{perm}} = wP_{\mathrm{ste}}^\top
+    x_{\mathrm{perm}} = xP_{\mathrm{hard}}^\top,\qquad
+    w_{\mathrm{perm}} = wP_{\mathrm{hard}}^\top
   \]
   \[
     y_q = Q_h(x_{\mathrm{perm}})\,Q_h(w_{\mathrm{perm}})^\top
   \]
 
-  当前实际优化目标：
+  但反向梯度通过 group surrogate 传播。当前目标写为：
   \[
     \Loss
     = \underbrace{\MSE(y_q, y_{\mathrm{ref}})}_{\Loss_{\mathrm{recon}}}
-    + \lambda_{\mathrm{ds}}
+    + \lambda_{\mathrm{grp}}
     \underbrace{\left(
-      \|P_{\mathrm{soft}}\mathbf{1}-\mathbf{1}\|_2^2
+      \|A_{\mathrm{soft}}\mathbf{1}-\mathbf{1}\|_2^2
       +
-      \|P_{\mathrm{soft}}^\top\mathbf{1}-\mathbf{1}\|_2^2
-    \right)}_{\Loss_{\mathrm{ds}}}
+      \|A_{\mathrm{soft}}^\top\mathbf{1}-k\mathbf{1}\|_2^2
+    \right)}_{\Loss_{\mathrm{group}}}
   \]
 
-  当前版本只保留了真正使用的双随机正则项。
+  这对应于：
+  \begin{itemize}
+    \item 每个 channel 的总分配质量为 1
+    \item 每个 group 的总容量接近 $k$
+  \end{itemize}
 \end{frame}
 
-\begin{frame}{8. 训练与评估口径}
+\begin{frame}{9. 训练与评估口径}
   \textbf{训练口径}
   \[
     \Loss_{\mathrm{train}}
-    = \Loss\bigl(P_{\mathrm{ste}}\bigr)
+    = \Loss\bigl(A_{\mathrm{ste}}\bigr)
   \]
 
   \textbf{评估口径}
@@ -262,7 +291,7 @@
   \]
 
   \vspace{0.4em}
-  baseline 则取 identity permutation：
+  baseline 则取 identity grouping：
   \[
     P = I
     \quad \Longrightarrow \quad
@@ -280,7 +309,7 @@
   训练中真正关心的不是单调下降，而是最终 hard 口径是否优于 baseline。
 \end{frame}
 
-\begin{frame}{9. 温度退火与 Early Stop}
+\begin{frame}{10. 温度退火与 Early Stop}
   温度采用指数退火：
   \[
     \tau_t
@@ -310,8 +339,8 @@
   \end{block}
 \end{frame}
 
-\begin{frame}{10. 局部离散 Refinement}
-  训练结束后，从当前最优 permutation 出发，做少量 pair-swap hill climbing：
+\begin{frame}{11. 局部离散 Refinement}
+  训练结束后，从当前最优分组对应的 hard 排列出发，做少量 pair-swap hill climbing：
   \[
     \pi \rightarrow \pi'
   \]
@@ -331,12 +360,12 @@
   这一步的意义是：
   \begin{itemize}
     \item 训练阶段优化的是可导近似目标
-    \item refinement 直接在真实 hard 目标上做局部离散搜索
+    \item refinement 直接在真实 hard 分组目标上做局部离散搜索
     \item 常能额外捡到一部分 hard loss 收益
   \end{itemize}
 \end{frame}
 
-\begin{frame}{11. 多卡并行策略}
+\begin{frame}{12. 多卡并行策略}
   当前实现采用 expert 级并行，而非梯度同步并行。
 
   对于总 expert 数 $E$、进程数 $W$、当前 rank $r$：
@@ -360,7 +389,7 @@
   \end{itemize}
 \end{frame}
 
-\begin{frame}{12. 结果产物设计}
+\begin{frame}{13. 结果产物设计}
   每个 expert 会保存一份结果对象，包含：
   \[
     \{\text{config},\ \text{baseline},\ \text{best\_perm},\ \text{best\_score},\ \text{loss history},\ \dots\}
@@ -372,7 +401,7 @@
     \item $\Loss_{\mathrm{best\_before\_refine}}$
     \item $\Loss_{\mathrm{refined}}$
     \item $\Loss_{\mathrm{final}}$
-    \item best permutation / best score
+    \item best group / final best group / best score
     \item loss / EMA / tau / lr 的历史序列
   \end{itemize}
 
@@ -384,12 +413,13 @@
   \end{itemize}
 \end{frame}
 
-\begin{frame}{13. 当前现象与理解}
+\begin{frame}{14. 当前现象与理解}
   当前实验已经实现：
   \begin{itemize}
     \item 方法链路打通
     \item 多卡运行
     \item 结果保存与自动画图
+    \item 训练语义从 full permutation 切到 group assignment
   \end{itemize}
 
   但目前观察到：
@@ -401,14 +431,14 @@
   \vspace{0.4em}
   这与以下因素有关：
   \begin{itemize}
-    \item permutation 本身是离散对象
-    \item 训练中同时用了 permutation STE 和 quant STE
-    \item soft 训练目标与 hard 评估目标之间存在 gap
+    \item grouping 本身仍由排序诱导，离散性依然存在
+    \item 训练中同时用了 OT 松弛与 quant STE
+    \item soft group surrogate 与 hard 分组评估之间仍存在 gap
     \item 学习率、温度退火等超参可能仍需继续调
   \end{itemize}
 \end{frame}
 
-\begin{frame}{14. 下一步工作}
+\begin{frame}{15. 下一步工作}
   后续重点并不在工程链路，而在训练稳定性与收益验证：
 
   \vspace{0.4em}
@@ -427,10 +457,10 @@
 
 \begin{frame}{总结}
   \begin{enumerate}
-    \item 当前方案本质上是在 expert 级别学习量化友好的输入通道重排
-    \item 方法上结合了 softsort、Sinkhorn、permutation STE 与 quant STE
-    \item 工程上已经支持多卡并行、结果保存与自动可视化
-    \item 当前主要瓶颈是训练稳定性与最终收益强度，而不是实现完整性
+    \item 当前方案本质上是在 expert 级别学习量化友好的 channel grouping
+    \item 方法上保留了 Sinkhorn/OT 的位置松弛，再通过块状矩阵聚合成 group assignment
+    \item 工程上已经支持多卡并行、group 结果保存与自动可视化
+    \item 当前主要瓶颈仍是训练稳定性与最终收益强度
   \end{enumerate}
 \end{frame}
 

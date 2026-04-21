@@ -253,6 +253,58 @@ def ste_perm_matrix_from_scores(
     return perm_hard, P_soft, P_hard, P_ste
 
 
+def build_group_block_matrix(dim: int, group_size: int, device: torch.device) -> torch.Tensor:
+    """
+    B[r, g] = 1 表示排序位置 r 属于第 g 个量化组。
+    形状: [D, G], 其中 G = D / group_size
+    """
+    if dim % group_size != 0:
+        raise ValueError(f"dim={dim} cannot be divided by group_size={group_size}")
+
+    num_groups = dim // group_size
+    B = torch.zeros(dim, num_groups, device=device, dtype=torch.float32)
+    rows = torch.arange(dim, device=device)
+    group_ids = rows // group_size
+    B[rows, group_ids] = 1.0
+    return B
+
+
+def group_assignment_from_perm_matrix(P: torch.Tensor, block_matrix: torch.Tensor) -> torch.Tensor:
+    """
+    由 position-level permutation/soft-permutation 折叠成 group assignment。
+
+    P: [D, D],   P[r, i] 表示 channel i 到排序位置 r 的权重
+    B: [D, G],   B[r, g] 表示排序位置 r 属于组 g
+
+    返回:
+      A: [D, G], A[i, g] 表示 channel i 属于组 g 的权重
+    """
+    return P.T @ block_matrix
+
+
+def soft_position_matrix_from_group_assignment(
+    assignment: torch.Tensor,
+    block_matrix: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """
+    将 group assignment 再提升回 position-level soft matrix。
+    同组内的 soft 权重均匀分配到该组的所有排序位置上。
+    """
+    return (block_matrix / float(group_size)) @ assignment.T
+
+
+def hard_group_indices_from_perm(perm: torch.Tensor, group_size: int) -> torch.Tensor:
+    """
+    group_idx[i] = channel i 被分到的组编号
+    """
+    D = perm.numel()
+    group_ids = torch.empty(D, device=perm.device, dtype=torch.long)
+    rows = torch.arange(D, device=perm.device)
+    group_ids[perm] = rows // group_size
+    return group_ids
+
+
 def apply_hard_perm_batch(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -376,6 +428,12 @@ def doubly_stochastic_regularization(P: torch.Tensor) -> torch.Tensor:
     return row_err + col_err
 
 
+def group_assignment_regularization(A: torch.Tensor, group_size: int) -> torch.Tensor:
+    row_err = ((A.sum(dim=1) - 1.0) ** 2).mean()
+    col_err = ((A.sum(dim=0) - float(group_size)) ** 2).mean()
+    return row_err + col_err
+
+
 def permutation_distance_to_identity(perm: torch.Tensor) -> float:
     D = perm.numel()
     identity = torch.arange(D, device=perm.device)
@@ -392,6 +450,21 @@ def max_displacement_to_identity(perm: torch.Tensor) -> int:
     D = perm.numel()
     identity = torch.arange(D, device=perm.device)
     return int((perm - identity).abs().max().item())
+
+
+def group_distance_to_identity(group_idx: torch.Tensor, group_size: int) -> float:
+    identity = torch.arange(group_idx.numel(), device=group_idx.device) // group_size
+    return (group_idx != identity).float().mean().item()
+
+
+def mean_group_displacement_to_identity(group_idx: torch.Tensor, group_size: int) -> float:
+    identity = torch.arange(group_idx.numel(), device=group_idx.device) // group_size
+    return float((group_idx - identity).abs().float().mean().item())
+
+
+def max_group_displacement_to_identity(group_idx: torch.Tensor, group_size: int) -> int:
+    identity = torch.arange(group_idx.numel(), device=group_idx.device) // group_size
+    return int((group_idx - identity).abs().max().item())
 
 
 def matrix_entropy_rows(P: torch.Tensor, eps: float = 1e-12) -> float:
@@ -576,15 +649,25 @@ def run_train_step(
 ) -> Tuple[float, torch.Tensor]:
     optimizer.zero_grad()
 
-    _, P_soft_train, _, P_ste_train = model(
+    _, P_soft_train, P_hard_train, _ = model(
         tau=tau, metric=metric, sinkhorn_iters=cfg.sinkhorn_iters
     )
+    block_matrix = build_group_block_matrix(
+        dim=x.shape[1], group_size=cfg.mxfp4_group_size, device=x.device
+    )
+    A_soft_train = group_assignment_from_perm_matrix(P_soft_train, block_matrix)
+    P_group_soft_train = soft_position_matrix_from_group_assignment(
+        A_soft_train, block_matrix, cfg.mxfp4_group_size
+    )
+    P_group_ste_train = P_hard_train - P_group_soft_train.detach() + P_group_soft_train
 
     loss, _ = compute_quant_loss_perm_matrix(
-        x, w, y_ref, P_ste_train, group_size=cfg.mxfp4_group_size, return_aux=False
+        x, w, y_ref, P_group_ste_train, group_size=cfg.mxfp4_group_size, return_aux=False
     )
 
-    reg_ds = cfg.doubly_stochastic_reg * doubly_stochastic_regularization(P_soft_train)
+    reg_ds = cfg.doubly_stochastic_reg * group_assignment_regularization(
+        A_soft_train, cfg.mxfp4_group_size
+    )
     total_loss = loss + reg_ds
     total_loss.backward()
 
@@ -592,7 +675,7 @@ def run_train_step(
     optimizer.step()
     scheduler.step()
 
-    return float(loss.detach().cpu()), P_soft_train.detach()
+    return float(loss.detach().cpu()), A_soft_train.detach()
 
 
 def evaluate_current_perm(
@@ -606,9 +689,14 @@ def evaluate_current_perm(
     hard_eval_ema: Optional[float],
 ) -> Dict[str, float]:
     with torch.no_grad():
+        block_matrix = build_group_block_matrix(
+            dim=x.shape[1], group_size=cfg.mxfp4_group_size, device=x.device
+        )
         perm_hard_eval, P_soft_eval, _, _ = model(
             tau=tau, metric=metric, sinkhorn_iters=cfg.sinkhorn_iters
         )
+        hard_group_eval = hard_group_indices_from_perm(perm_hard_eval, cfg.mxfp4_group_size)
+        A_soft_eval = group_assignment_from_perm_matrix(P_soft_eval, block_matrix)
         hard_eval_loss, _ = compute_quant_loss_hard(
             x, w, y_ref, perm_hard_eval, group_size=cfg.mxfp4_group_size, return_aux=False
         )
@@ -620,15 +708,20 @@ def evaluate_current_perm(
             hard_eval_ema = cfg.ema_beta_for_earlystop * hard_eval_ema + \
                             (1.0 - cfg.ema_beta_for_earlystop) * hard_eval_loss_val
 
-        changed_ratio = permutation_distance_to_identity(perm_hard_eval)
-        mean_disp = mean_displacement_to_identity(perm_hard_eval)
-        max_disp = max_displacement_to_identity(perm_hard_eval)
-        soft_entropy = matrix_entropy_rows(P_soft_eval)
-        soft_avg_maxprob = matrix_avg_max_prob(P_soft_eval)
-        soft_row_err, soft_col_err = matrix_row_col_error(P_soft_eval)
+        changed_ratio = group_distance_to_identity(hard_group_eval, cfg.mxfp4_group_size)
+        mean_disp = mean_group_displacement_to_identity(hard_group_eval, cfg.mxfp4_group_size)
+        max_disp = max_group_displacement_to_identity(hard_group_eval, cfg.mxfp4_group_size)
+        soft_entropy = matrix_entropy_rows(A_soft_eval)
+        soft_avg_maxprob = matrix_avg_max_prob(A_soft_eval)
+        soft_row_err = float(((A_soft_eval.sum(dim=1) - 1.0) ** 2).mean().detach().cpu())
+        soft_col_err = float(
+            ((A_soft_eval.sum(dim=0) - float(cfg.mxfp4_group_size)) ** 2).mean().detach().cpu()
+        )
 
     return {
         "perm_hard_eval": perm_hard_eval.detach().cpu().clone(),
+        "group_hard_eval": hard_group_eval.detach().cpu().clone(),
+        "A_soft_eval": A_soft_eval.detach().cpu().clone(),
         "hard_eval_loss_val": hard_eval_loss_val,
         "hard_eval_ema": float(hard_eval_ema),
         "changed_ratio": changed_ratio,
@@ -693,6 +786,8 @@ def train_one_expert(
     best_loss = float("inf")
     best_ema = float("inf")
     best_perm = None
+    best_group = None
+    best_group_assignment = None
     best_score = None
     best_epoch = -1
 
@@ -700,9 +795,9 @@ def train_one_expert(
     loss_ema_history = []
     tau_history = []
     lr_history = []
-    changed_ratio_history = []
-    mean_displacement_history = []
-    max_displacement_history = []
+    group_changed_ratio_history = []
+    group_mean_displacement_history = []
+    group_max_displacement_history = []
     soft_entropy_history = []
     soft_avg_maxprob_history = []
     soft_row_error_history = []
@@ -743,6 +838,8 @@ def train_one_expert(
             best_ema = hard_eval_ema
             best_loss = hard_eval_loss_val
             best_perm = eval_stats["perm_hard_eval"]
+            best_group = eval_stats["group_hard_eval"]
+            best_group_assignment = eval_stats["A_soft_eval"]
             best_score = model.score.detach().cpu().clone()
             best_epoch = epoch
             no_improve_steps = 0
@@ -753,9 +850,9 @@ def train_one_expert(
         loss_ema_history.append(hard_eval_ema)
         tau_history.append(float(tau))
         lr_history.append(float(optimizer.param_groups[0]["lr"]))
-        changed_ratio_history.append(changed_ratio)
-        mean_displacement_history.append(mean_disp)
-        max_displacement_history.append(max_disp)
+        group_changed_ratio_history.append(changed_ratio)
+        group_mean_displacement_history.append(mean_disp)
+        group_max_displacement_history.append(max_disp)
         soft_entropy_history.append(soft_entropy)
         soft_avg_maxprob_history.append(soft_avg_maxprob)
         soft_row_error_history.append(soft_row_err)
@@ -774,13 +871,13 @@ def train_one_expert(
                 f"hard_eval_ema={hard_eval_ema:.6e} "
                 f"baseline={baseline_loss:.6e} "
                 f"improve={improve_ratio:.4%} "
-                f"changed_ratio={changed_ratio:.4f} "
-                f"mean_disp={mean_disp:.2f} "
-                f"max_disp={max_disp:d} "
-                f"soft_entropy={soft_entropy:.4f} "
-                f"soft_avg_maxprob={soft_avg_maxprob:.4f} "
-                f"row_err={soft_row_err:.3e} "
-                f"col_err={soft_col_err:.3e}"
+                f"group_changed_ratio={changed_ratio:.4f} "
+                f"group_mean_disp={mean_disp:.2f} "
+                f"group_max_disp={max_disp:d} "
+                f"group_entropy={soft_entropy:.4f} "
+                f"group_avg_maxprob={soft_avg_maxprob:.4f} "
+                f"group_row_err={soft_row_err:.3e} "
+                f"group_col_err={soft_col_err:.3e}"
             )
 
         if no_improve_steps >= cfg.early_stop_patience:
@@ -792,8 +889,10 @@ def train_one_expert(
 
     # 对 best_perm 做一点 cheap hard refinement
     if best_perm is None:
-        print(f"[Warn] {key}: no best_perm captured during training, fallback to identity permutation.")
+        print(f"[Warn] {key}: no best group captured during training, fallback to identity grouping.")
         best_perm = torch.arange(D, dtype=torch.long)
+        best_group = hard_group_indices_from_perm(best_perm, cfg.mxfp4_group_size).cpu()
+        best_group_assignment = None
         best_score = model.score.detach().cpu().clone()
         best_epoch = -1
         best_ema = float("nan")
@@ -810,6 +909,9 @@ def train_one_expert(
 
     final_best_loss = min(best_loss, refined_loss)
     final_best_perm = best_perm if best_loss <= refined_loss else refined_perm_cpu
+    final_best_group = hard_group_indices_from_perm(
+        final_best_perm.to(device), cfg.mxfp4_group_size
+    ).detach().cpu().clone()
     final_best_source = "train_best" if best_loss <= refined_loss else "local_swap_refine"
 
     improvement_vs_identity = (baseline_loss - final_best_loss) / max(abs(baseline_loss), 1e-12)
@@ -844,14 +946,17 @@ def train_one_expert(
         "final_best_source": final_best_source,
         "improvement_vs_identity": improvement_vs_identity,
         "best_perm": final_best_perm,
+        "best_group": best_group,
+        "best_group_assignment": best_group_assignment,
+        "final_best_group": final_best_group,
         "best_score": best_score,
         "loss_history": loss_history,
         "loss_ema_history": loss_ema_history,
         "tau_history": tau_history,
         "lr_history": lr_history,
-        "changed_ratio_history": changed_ratio_history,
-        "mean_displacement_history": mean_displacement_history,
-        "max_displacement_history": max_displacement_history,
+        "group_changed_ratio_history": group_changed_ratio_history,
+        "group_mean_displacement_history": group_mean_displacement_history,
+        "group_max_displacement_history": group_max_displacement_history,
         "soft_entropy_history": soft_entropy_history,
         "soft_avg_maxprob_history": soft_avg_maxprob_history,
         "soft_row_error_history": soft_row_error_history,
