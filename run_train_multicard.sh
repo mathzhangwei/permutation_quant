@@ -3,6 +3,7 @@
 set -euo pipefail
 
 NPUS_PER_NODE="${NPUS_PER_NODE:-4}"
+MASTER_PORT="${MASTER_PORT:-29611}"
 LAYER_START="${LAYER_START:-2}"
 LAYER_END="${LAYER_END:-2}"
 NUM_EXPERTS="${NUM_EXPERTS:-64}"
@@ -24,6 +25,7 @@ fi
 CMD=(
   torchrun
   --nproc_per_node "${NPUS_PER_NODE}"
+  --master_port "${MASTER_PORT}"
   train.py
   --layer-start "${LAYER_START}"
   --layer-end "${LAYER_END}"
@@ -38,6 +40,7 @@ CMD=(
 
 echo "Running multi-card training with:"
 echo "  NPUS_PER_NODE=${NPUS_PER_NODE}"
+echo "  MASTER_PORT=${MASTER_PORT}"
 echo "  LAYER_START=${LAYER_START}"
 echo "  LAYER_END=${LAYER_END}"
 echo "  NUM_EXPERTS=${NUM_EXPERTS}"
