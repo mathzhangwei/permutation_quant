@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-NPUS_PER_NODE="${NPUS_PER_NODE:-8}"
+NPUS_PER_NODE="${NPUS_PER_NODE:-4}"
 LAYER_START="${LAYER_START:-2}"
 LAYER_END="${LAYER_END:-2}"
 NUM_EXPERTS="${NUM_EXPERTS:-64}"
@@ -16,6 +16,11 @@ SOFTSORT_METRIC="${SOFTSORT_METRIC:-l1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
+if [[ -z "${OUTPUT_ROOT}" ]]; then
+  RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+  OUTPUT_ROOT="PermuteDown_BatchScore_HardForward_SoftBackward_STE_MXFP4_v2/${RUN_TIMESTAMP}"
+fi
+
 CMD=(
   torchrun
   --nproc_per_node "${NPUS_PER_NODE}"
@@ -28,11 +33,8 @@ CMD=(
   --epochs "${EPOCHS}"
   --lr "${LR}"
   --softsort-metric "${SOFTSORT_METRIC}"
+  --output-root "${OUTPUT_ROOT}"
 )
-
-if [[ -n "${OUTPUT_ROOT}" ]]; then
-  CMD+=(--output-root "${OUTPUT_ROOT}")
-fi
 
 echo "Running multi-card training with:"
 echo "  NPUS_PER_NODE=${NPUS_PER_NODE}"
@@ -44,10 +46,6 @@ echo "  WEIGHTS_PATH=${WEIGHTS_PATH}"
 echo "  EPOCHS=${EPOCHS}"
 echo "  LR=${LR}"
 echo "  SOFTSORT_METRIC=${SOFTSORT_METRIC}"
-if [[ -n "${OUTPUT_ROOT}" ]]; then
-  echo "  OUTPUT_ROOT=${OUTPUT_ROOT}"
-else
-  echo "  OUTPUT_ROOT=<auto timestamped by train.py>"
-fi
+echo "  OUTPUT_ROOT=${OUTPUT_ROOT}"
 
 "${CMD[@]}"

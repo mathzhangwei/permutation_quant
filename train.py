@@ -86,6 +86,9 @@ def parse_args() -> argparse.Namespace:
 def resolve_output_root(output_root: Optional[str]) -> str:
     if output_root:
         return output_root
+    shared_output_root = os.environ.get("PERM_OUTPUT_ROOT")
+    if shared_output_root:
+        return shared_output_root
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     return os.path.join(OUTPUT_ROOT, timestamp)
 
