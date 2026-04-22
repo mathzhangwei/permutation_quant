@@ -63,6 +63,7 @@ def plot_single_result(
     loss_history = result.get("loss_history", [])
     loss_ema_history = result.get("loss_ema_history", [])
     baseline = result.get("baseline_identity_loss")
+    identity_refined_loss = result.get("identity_refined_loss")
     best_loss = result.get("best_loss_before_refine")
     final_best_loss = result.get("final_best_loss")
     improvement = result.get("improvement_vs_identity")
@@ -81,6 +82,15 @@ def plot_single_result(
 
     if baseline is not None:
         ax.axhline(baseline, color="tab:red", linestyle="--", linewidth=1.5, label="baseline_identity")
+
+    if identity_refined_loss is not None:
+        ax.axhline(
+            identity_refined_loss,
+            color="tab:orange",
+            linestyle="--",
+            linewidth=1.3,
+            label="identity_direct_refine",
+        )
 
     if best_loss is not None:
         ax.axhline(best_loss, color="tab:green", linestyle=":", linewidth=1.3, label="best_before_refine")
@@ -108,6 +118,7 @@ def plot_single_result(
         "layer_id": layer_id,
         "expert_id": expert_id,
         "baseline_identity_loss": baseline,
+        "identity_refined_loss": identity_refined_loss,
         "best_loss_before_refine": best_loss,
         "final_best_loss": final_best_loss,
         "improvement_vs_identity": improvement,

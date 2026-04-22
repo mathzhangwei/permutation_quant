@@ -785,6 +785,14 @@ def train_one_expert(
             x, w, y_ref, perm_identity, group_size=cfg.mxfp4_group_size, return_aux=False
         )
         baseline_loss = float(baseline_loss.cpu())
+        identity_refined_perm, identity_refined_loss = local_swap_refine(
+            x, w, y_ref, perm_identity, group_size=cfg.mxfp4_group_size, n_steps=64
+        )
+        identity_refined_perm = identity_refined_perm.detach().cpu().clone()
+
+    identity_refine_improvement_vs_identity = (
+        baseline_loss - identity_refined_loss
+    ) / max(abs(baseline_loss), 1e-12)
 
     best_loss = float("inf")
     best_ema = float("inf")
@@ -942,6 +950,9 @@ def train_one_expert(
         "early_stop_rel_delta": cfg.early_stop_rel_delta,
         "ema_beta_for_earlystop": cfg.ema_beta_for_earlystop,
         "baseline_identity_loss": baseline_loss,
+        "identity_refined_loss": identity_refined_loss,
+        "identity_refined_perm": identity_refined_perm,
+        "identity_refine_improvement_vs_identity": identity_refine_improvement_vs_identity,
         "best_ema_before_refine": best_ema,
         "best_loss_before_refine": best_loss,
         "best_epoch": best_epoch,
@@ -974,6 +985,8 @@ def train_one_expert(
         "expert_id": expert_id,
         "best_ema_before_refine": best_ema,
         "baseline_identity_loss": baseline_loss,
+        "identity_refined_loss": identity_refined_loss,
+        "identity_refine_improvement_vs_identity": identity_refine_improvement_vs_identity,
         "best_loss_before_refine": best_loss,
         "refined_loss": refined_loss,
         "final_best_loss": final_best_loss,
